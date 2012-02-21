@@ -45,23 +45,15 @@
 #define LIKELY( exp )       (__builtin_expect( (exp) != 0, true  ))
 #define UNLIKELY( exp )     (__builtin_expect( (exp) != 0, false ))
 
-enum HWCLayerType{
-    HWC_SINGLE_VIDEO           = 0x1,
-    HWC_ORIG_RESOLUTION        = 0x2,
-    HWC_S3D_LAYER              = 0x4,
-    HWC_STOP_UI_MIRRORING_MASK = 0xF
-};
-
 #ifdef COMPOSITION_BYPASS
+#define MAX_BYPASS_LAYERS 3
+#define BYPASS_DEBUG 0
+#define BYPASS_INDEX_OFFSET 4
+
 enum BypassState {
     BYPASS_ON,
     BYPASS_OFF,
     BYPASS_OFF_PENDING,
-};
-
-enum {
-    MAX_BYPASS_LAYERS = 2,
-    ANIM_FRAME_COUNT = 30,
 };
 
 enum BypassBufferLockState {
@@ -69,6 +61,13 @@ enum BypassBufferLockState {
     BYPASS_BUFFER_LOCKED,
 };
 #endif
+
+enum HWCLayerType{
+    HWC_SINGLE_VIDEO           = 0x1,
+    HWC_ORIG_RESOLUTION        = 0x2,
+    HWC_S3D_LAYER              = 0x4,
+    HWC_STOP_UI_MIRRORING_MASK = 0xF
+};
 
 enum eHWCOverlayStatus {
     HWC_OVERLAY_OPEN,
@@ -85,7 +84,8 @@ struct hwc_context_t {
     overlay::OverlayUI* mOvUI[MAX_BYPASS_LAYERS];
     native_handle_t* previousBypassHandle[MAX_BYPASS_LAYERS];
     BypassBufferLockState bypassBufferLockState[MAX_BYPASS_LAYERS];
-    int animCount;
+    int layerindex[MAX_BYPASS_LAYERS];
+    int nPipesUsed;
     BypassState bypassState;
 #endif
 #if defined HDMI_DUAL_DISPLAY
@@ -153,6 +153,375 @@ static inline int max(const int& a, const int& b) {
     return (a > b) ? a : b;
 }
 
+#ifdef COMPOSITION_BYPASS
+void setLayerbypassIndex(hwc_layer_t* layer, const int bypass_index)
+{
+    layer->flags &= ~HWC_BYPASS_INDEX_MASK;
+    layer->flags |= bypass_index << BYPASS_INDEX_OFFSET;
+}
+
+int  getLayerbypassIndex(hwc_layer_t* layer)
+{
+    int byp_index = -1;
+
+    if(layer->flags & HWC_COMP_BYPASS) {
+        byp_index = ((layer->flags & HWC_BYPASS_INDEX_MASK) >> BYPASS_INDEX_OFFSET);
+        byp_index = (byp_index < MAX_BYPASS_LAYERS ? byp_index : -1 );
+    }
+    return byp_index;
+}
+
+void unlockPreviousBypassBuffers(hwc_context_t* ctx) {
+    // Unlock the previous bypass buffers. We can blindly unlock the buffers here,
+    // because buffers will be in this list only if the lock was successfully acquired.
+    for(int i = 0; i < MAX_BYPASS_LAYERS && ctx->previousBypassHandle[i]; i++) {
+       private_handle_t *hnd = (private_handle_t*) ctx->previousBypassHandle[i];
+
+       // Validate the handle to make sure it hasn't been deallocated.
+       if (private_handle_t::validate(ctx->previousBypassHandle[i])) {
+            continue;
+       }
+       // Check if the handle was locked previously
+       if (private_handle_t::PRIV_FLAGS_HWC_LOCK & hnd->flags) {
+          if (GENLOCK_FAILURE == genlock_unlock_buffer(ctx->previousBypassHandle[i])) {
+              LOGE("%s: genlock_unlock_buffer failed", __FUNCTION__);
+          } else {
+              ctx->previousBypassHandle[i] = NULL;
+              // Reset the lock flag
+              hnd->flags &= ~private_handle_t::PRIV_FLAGS_HWC_LOCK;
+          }
+       }
+    }
+}
+
+void print_info(hwc_layer_t* layer)
+{
+     hwc_rect_t sourceCrop = layer->sourceCrop;
+     hwc_rect_t displayFrame = layer->displayFrame;
+
+     int s_l = sourceCrop.left;
+     int s_t = sourceCrop.top;
+     int s_r = sourceCrop.right;
+     int s_b = sourceCrop.bottom;
+
+     int d_l = displayFrame.left;
+     int d_t = displayFrame.top;
+     int d_r = displayFrame.right;
+     int d_b = displayFrame.bottom;
+
+     LOGE_IF(BYPASS_DEBUG, "src:[%d,%d,%d,%d] (%d x %d) dst:[%d,%d,%d,%d] (%d x %d)",
+                             s_l, s_t, s_r, s_b, (s_r - s_l), (s_b - s_t),
+                             d_l, d_t, d_r, d_b, (d_r - d_l), (d_b - d_t));
+}
+
+//Crops source buffer against destination and FB boundaries
+void calculate_crop_rects(hwc_rect_t& crop, hwc_rect_t& dst, int hw_w, int hw_h) {
+
+    int& crop_x = crop.left;
+    int& crop_y = crop.top;
+    int& crop_r = crop.right;
+    int& crop_b = crop.bottom;
+    int crop_w = crop.right - crop.left;
+    int crop_h = crop.bottom - crop.top;
+
+    int& dst_x = dst.left;
+    int& dst_y = dst.top;
+    int& dst_r = dst.right;
+    int& dst_b = dst.bottom;
+    int dst_w = dst.right - dst.left;
+    int dst_h = dst.bottom - dst.top;
+
+    if(dst_x < 0) {
+        float scale_x =  crop_w * 1.0f / dst_w;
+        float diff_factor = (scale_x * abs(dst_x));
+        crop_x = crop_x + (int)diff_factor;
+        crop_w = crop_r - crop_x;
+
+        dst_x = 0;
+        dst_w = dst_r - dst_x;;
+    }
+    if(dst_r > hw_w) {
+        float scale_x = crop_w * 1.0f / dst_w;
+        float diff_factor = scale_x * (dst_r - hw_w);
+        crop_r = crop_r - diff_factor;
+        crop_w = crop_r - crop_x;
+
+        dst_r = hw_w;
+        dst_w = dst_r - dst_x;
+    }
+    if(dst_y < 0) {
+        float scale_y = crop_h * 1.0f / dst_h;
+        float diff_factor = scale_y * abs(dst_y);
+        crop_y = crop_y + diff_factor;
+        crop_h = crop_b - crop_y;
+
+        dst_y = 0;
+        dst_h = dst_b - dst_y;
+    }
+    if(dst_b > hw_h) {
+        float scale_y = crop_h * 1.0f / dst_h;
+        float diff_factor = scale_y * (dst_b - hw_h);
+        crop_b = crop_b - diff_factor;
+        crop_h = crop_b - crop_y;
+
+        dst_b = hw_h;
+        dst_h = dst_b - dst_y;
+    }
+
+    LOGE_IF(BYPASS_DEBUG,"crop: [%d,%d,%d,%d] dst:[%d,%d,%d,%d]",
+                     crop_x, crop_y, crop_w, crop_h,dst_x, dst_y, dst_w, dst_h);
+}
+
+/*
+ * Configures pipe(s) for composition bypass
+ */
+static int prepareBypass(hwc_context_t *ctx, hwc_layer_t *layer,
+                        int nPipeIndex, int vsync_wait, int isFG) {
+
+    if (ctx && ctx->mOvUI[nPipeIndex]) {
+        overlay::OverlayUI *ovUI = ctx->mOvUI[nPipeIndex];
+
+        private_hwc_module_t* hwcModule = reinterpret_cast<
+                private_hwc_module_t*>(ctx->device.common.module);
+        if (!hwcModule) {
+            LOGE("%s: NULL Module", __FUNCTION__);
+            return -1;
+        }
+
+        private_handle_t *hnd = (private_handle_t *)layer->handle;
+        if(!hnd) {
+            LOGE("%s: layer handle is NULL", __FUNCTION__);
+            return -1;
+        }
+
+        int hw_w = hwcModule->fbDevice->width;
+        int hw_h = hwcModule->fbDevice->height;
+
+        hwc_rect_t sourceCrop = layer->sourceCrop;
+        hwc_rect_t displayFrame = layer->displayFrame;
+
+        const int src_w = sourceCrop.right - sourceCrop.left;
+        const int src_h = sourceCrop.bottom - sourceCrop.top;
+
+        hwc_rect_t crop = sourceCrop;
+        int crop_w = crop.right - crop.left;
+        int crop_h = crop.bottom - crop.top;
+
+        hwc_rect_t dst = displayFrame;
+        int dst_w = dst.right - dst.left;
+        int dst_h = dst.bottom - dst.top;
+
+        if(hnd != NULL && (hnd->flags & private_handle_t::PRIV_FLAGS_NONCONTIGUOUS_MEM )) {
+            LOGE("%s: Unable to setup bypass due to non-pmem memory",__FUNCTION__);
+            return -1;
+        }
+
+        if(dst.left < 0 || dst.right < 0 || dst.right > hw_w || dst.bottom > hw_h) {
+            LOGE_IF(BYPASS_DEBUG,"%s: Destination has negative coordinates", __FUNCTION__);
+
+            calculate_crop_rects(crop, dst, hw_w, hw_h);
+
+            //Update calulated width and height
+            crop_w = crop.right - crop.left;
+            crop_h = crop.bottom - crop.top;
+
+            dst_w = dst.right - dst.left;
+            dst_h = dst.bottom - dst.top;
+        }
+
+        if( (dst_w > hw_w)|| (dst_h > hw_h)) {
+            LOGE_IF(BYPASS_DEBUG,"%s: Destination rectangle exceeds FB resolution", __FUNCTION__);
+            print_info(layer);
+            dst_w = hw_w;
+            dst_h = hw_h;
+        }
+
+        overlay_buffer_info info;
+        info.width = src_w;
+        info.height = src_h;
+        info.format = hnd->format;
+        info.size = hnd->size;
+
+        int fbnum = 0;
+        int orientation = layer->transform;
+        const bool useVGPipe =  (nPipeIndex != (MAX_BYPASS_LAYERS-1));
+        //only last layer should wait for vsync
+        const bool waitForVsync = vsync_wait;
+        const bool isFg = isFG;
+        //Just to differentiate zorders for different layers
+        const int zorder = nPipeIndex;
+
+        ovUI->setSource(info, orientation);
+        ovUI->setCrop(crop.left, crop.top, crop_w, crop_h);
+        ovUI->setDisplayParams(fbnum, waitForVsync, isFg, zorder, useVGPipe);
+        ovUI->setPosition(dst.left, dst.top, dst_w, dst_h);
+
+        if(ovUI->commit() != overlay::NO_ERROR) {
+            LOGE("%s: Overlay Commit failed", __FUNCTION__);
+            return -1;
+        }
+
+        LOGE_IF(BYPASS_DEBUG,"%s: Bypass set: crop[%d,%d,%d,%d] dst[%d,%d,%d,%d] waitforVsync: %d \
+                                isFg: %d zorder: %d VG = %d nPipe: %d",__FUNCTION__,
+                                crop.left, crop.top, crop_w, crop_h,
+                                dst.left, dst.top, dst_w, dst_h,
+                                waitForVsync, isFg, zorder, useVGPipe, nPipeIndex );
+
+    }
+    return 0;
+}
+
+/*
+ * Checks if doing comp. bypass is possible.
+ * It is possible if
+ * 1. No MDP pipe is used
+ * 2. Rotation is not needed
+ * 3. We have atmost MAX_BYPASS_LAYERS
+ */
+inline static bool isBypassDoable(hwc_composer_device_t *dev, const int yuvCount,
+        const hwc_layer_list_t* list) {
+    hwc_context_t* ctx = (hwc_context_t*)(dev);
+    private_hwc_module_t* hwcModule = reinterpret_cast<private_hwc_module_t*>(
+                                                           dev->common.module);
+    //Check if enabled in build.prop
+    if(hwcModule->isBypassEnabled == false) {
+        return false;
+    }
+
+    if(list->numHwLayers < 1) {
+        return false;
+    }
+
+#if defined HDMI_DUAL_DISPLAY
+    //Disable bypass when HDMI is enabled
+    if(ctx->mHDMIEnabled || ctx->pendingHDMI) {
+        return false;
+    }
+#endif
+
+    //Bypass is not efficient if rotation is needed.
+    for(int i = 0; i < list->numHwLayers; ++i) {
+        if(list->hwLayers[i].transform) {
+            return false;
+        }
+    }
+
+    return (yuvCount == 0) && (ctx->hwcOverlayStatus == HWC_OVERLAY_CLOSED)
+                                   && (list->numHwLayers <= MAX_BYPASS_LAYERS);
+}
+
+void setBypassLayerFlags(hwc_context_t* ctx, hwc_layer_list_t* list)
+{
+    for(int index = 0 ; index < MAX_BYPASS_LAYERS; index++ )
+    {
+        int layer_index = ctx->layerindex[index];
+        if(layer_index >= 0) {
+            hwc_layer_t* layer = &(list->hwLayers[layer_index]);
+
+            layer->flags |= HWC_COMP_BYPASS;
+            layer->compositionType = HWC_USE_OVERLAY;
+            layer->hints |= HWC_HINT_CLEAR_FB;
+        }
+    }
+
+    if( list->numHwLayers > ctx->nPipesUsed ) {
+         list->flags &= ~HWC_SKIP_COMPOSITION; //Compose to FB
+    } else {
+         list->flags |= HWC_SKIP_COMPOSITION; // Dont
+    }
+}
+
+bool setupBypass(hwc_context_t* ctx, hwc_layer_list_t* list) {
+    int nPipeIndex, vsync_wait, isFG;
+    int numHwLayers = list->numHwLayers;
+    int nPipeAvailable = MAX_BYPASS_LAYERS;
+
+    for (int index = 0 ; (index < numHwLayers) && nPipeAvailable; index++) {
+
+        hwc_layer_t* layer = &(list->hwLayers[index]);
+
+        nPipeIndex =  MAX_BYPASS_LAYERS - nPipeAvailable;
+        //Set VSYNC wait is needed only for the last pipe queued
+        vsync_wait = (nPipeIndex == (numHwLayers-1));
+        //Set isFG to true for layer with z-order zero
+        isFG = !index;
+
+        //Clear Bypass flags for the layer
+        layer->flags &= ~HWC_COMP_BYPASS;
+        layer->flags |= HWC_BYPASS_INDEX_MASK;
+
+        if( prepareBypass(ctx, &(list->hwLayers[index]), nPipeIndex, vsync_wait, isFG) != 0 ) {
+           LOGE_IF(BYPASS_DEBUG, "%s: layer %d failed to configure bypass for pipe index: %d",
+                                                               __FUNCTION__, index, nPipeIndex);
+           return false;
+         } else {
+           ctx->layerindex[nPipeIndex] = index;
+           setLayerbypassIndex(layer, nPipeIndex);
+           nPipeAvailable--;
+         }
+    }
+    ctx->nPipesUsed =  MAX_BYPASS_LAYERS - nPipeAvailable;
+    return true;
+}
+
+void unsetBypassLayerFlags(hwc_layer_list_t* list) {
+    for (int index = 0 ; index < list->numHwLayers; index++) {
+        if(list->hwLayers[index].flags & HWC_COMP_BYPASS) {
+            list->hwLayers[index].flags &= ~HWC_COMP_BYPASS;
+        }
+    }
+}
+
+void unsetBypassBufferLockState(hwc_context_t* ctx) {
+    for (int i= 0; i< MAX_BYPASS_LAYERS; i++) {
+        ctx->bypassBufferLockState[i] = BYPASS_BUFFER_UNLOCKED;
+    }
+}
+
+void storeLockedBypassHandle(hwc_layer_list_t* list, hwc_context_t* ctx) {
+   for(int index = 0; index < MAX_BYPASS_LAYERS; index++ ) {
+       hwc_layer_t layer = list->hwLayers[ctx->layerindex[index]];
+
+       if (layer.flags & HWC_COMP_BYPASS) {
+            private_handle_t *hnd = (private_handle_t*)layer.handle;
+
+            if (ctx->bypassBufferLockState[index] == BYPASS_BUFFER_LOCKED) {
+               ctx->previousBypassHandle[index] = (native_handle_t*)layer.handle;
+               hnd->flags |= private_handle_t::PRIV_FLAGS_HWC_LOCK;
+           } else {
+              ctx->previousBypassHandle[index] = NULL;
+           }
+       }
+   }
+}
+
+void closeExtraPipes(hwc_context_t* ctx) {
+
+    int pipes_used = ctx->nPipesUsed;
+
+    //Unused pipes must be of higher z-order
+    for (int i =  pipes_used ; i < MAX_BYPASS_LAYERS; i++) {
+        if (ctx->previousBypassHandle[i]) {
+            private_handle_t *hnd = (private_handle_t*) ctx->previousBypassHandle[i];
+
+            if (private_handle_t::validate(ctx->previousBypassHandle[i])) {
+                continue;
+            }
+
+            if (GENLOCK_FAILURE == genlock_unlock_buffer(ctx->previousBypassHandle[i])) {
+                LOGE("%s: genlock_unlock_buffer failed", __FUNCTION__);
+            } else {
+                ctx->previousBypassHandle[i] = NULL;
+                ctx->bypassBufferLockState[i] = BYPASS_BUFFER_UNLOCKED;
+                hnd->flags &= ~private_handle_t::PRIV_FLAGS_HWC_LOCK;
+            }
+        }
+        ctx->mOvUI[i]->closeChannel();
+        ctx->layerindex[i] = -1;
+    }
+}
+#endif  //COMPOSITION_BYPASS
+
 static int setVideoOverlayStatusInGralloc(hwc_context_t* ctx, const bool enable) {
 #if defined HDMI_DUAL_DISPLAY
     private_hwc_module_t* hwcModule = reinterpret_cast<private_hwc_module_t*>(
@@ -214,43 +583,6 @@ static int hwc_closeOverlayChannels(hwc_context_t* ctx) {
     return 0;
 }
 
-#ifdef COMPOSITION_BYPASS
-// To-do: Merge this with other blocks & move them to a separate file.
-void unlockPreviousBypassBuffers(hwc_context_t* ctx) {
-    // Unlock the previous bypass buffers. We can blindly unlock the buffers here,
-    // because buffers will be in this list only if the lock was successfully acquired.
-    for(int i = 0; i < MAX_BYPASS_LAYERS; i++) {
-        if (ctx->previousBypassHandle[i]) {
-            private_handle_t *hnd = (private_handle_t*) ctx->previousBypassHandle[i];
-            // Validate the handle to make sure it hasn't been deallocated.
-            if (private_handle_t::validate(ctx->previousBypassHandle[i])) {
-                continue;
-            }
-            // Check if the handle was locked previously
-            if (private_handle_t::PRIV_FLAGS_HWC_LOCK & hnd->flags) {
-                if (GENLOCK_FAILURE == genlock_unlock_buffer(ctx->previousBypassHandle[i])) {
-                    LOGE("%s: genlock_unlock_buffer failed", __FUNCTION__);
-                } else {
-                    ctx->previousBypassHandle[i] = NULL;
-                    // Reset the lock flag
-                    hnd->flags &= ~private_handle_t::PRIV_FLAGS_HWC_LOCK;
-                }
-            }
-        }
-    }
-}
-
-void closeBypass(hwc_context_t* ctx) {
-        unlockPreviousBypassBuffers(ctx);
-        for (int index = 0 ; index < MAX_BYPASS_LAYERS; index++) {
-            ctx->mOvUI[index]->closeChannel();
-        }
-        #ifdef DEBUG
-            LOGE("%s", __FUNCTION__);
-        #endif
-    }
-#endif
-
 /*
  * Configures mdp pipes
  */
@@ -259,7 +591,8 @@ static int prepareOverlay(hwc_context_t *ctx, hwc_layer_t *layer, const bool wai
 
 #ifdef COMPOSITION_BYPASS
      if(ctx && (ctx->bypassState != BYPASS_OFF)) {
-        closeBypass(ctx);
+        ctx->nPipesUsed = 0;
+        closeExtraPipes(ctx);
         ctx->bypassState = BYPASS_OFF;
      }
 #endif
@@ -344,9 +677,15 @@ bool canSkipComposition(hwc_context_t* ctx, int yuvBufferCount, int currentLayer
                         int numLayersNotUpdating)
 {
     if (!ctx) {
-        LOGE("canSkipComposition invalid context");
+        LOGE("%s: invalid context",__FUNCTION__);
         return false;
     }
+
+    hwc_composer_device_t* dev = (hwc_composer_device_t *)(ctx);
+    private_hwc_module_t* hwcModule = reinterpret_cast<private_hwc_module_t*>(
+                                                           dev->common.module);
+    if (hwcModule->compositionType == COMPOSITION_TYPE_CPU)
+        return false;
 
     bool compCountChanged = false;
     if (yuvBufferCount == 1) {
@@ -370,7 +709,15 @@ bool canSkipComposition(hwc_context_t* ctx, int yuvBufferCount, int currentLayer
     return false;
 }
 
-static bool isFullScreenUpdate(const framebuffer_device_t* fbDev, const hwc_layer_list_t* list) {
+inline void getLayerResolution(const hwc_layer_t* layer, int& width, int& height)
+{
+   hwc_rect_t displayFrame  = layer->displayFrame;
+
+   width = displayFrame.right - displayFrame.left;
+   height = displayFrame.bottom - displayFrame.top;
+}
+
+static bool canUseCopybit(const framebuffer_device_t* fbDev, const hwc_layer_list_t* list) {
 
     if(!fbDev) {
        LOGE("ERROR: %s : fb device is invalid",__func__);
@@ -381,52 +728,31 @@ static bool isFullScreenUpdate(const framebuffer_device_t* fbDev, const hwc_laye
     int fb_h = fbDev->height;
 
     /*
-     *  We have full screen condition when
+     * We can use copybit when
      * 1. We have 1 layer to compose
-     *    a. layers dest rect equals display resolution.
      * 2. We have 2 layers to compose
-     *    a. Sum of their dest rects equals display resolution.
+     *    a. Sum of both layers covers full screen
+     *    b. One of the layers is full screen and the
+     *       other is less than full screen (includes
+     *       pop ups, volume bar etc.)
+     * TODO: Need to revisit this logic to use copybit
+     * based on the total blitting region instead of total
+     * layers count
      */
 
-    if(list->numHwLayers == 1)
-    {
-        hwc_rect_t rect = list->hwLayers[0].displayFrame;
-
-        int w = rect.right - rect.left;
-        int h = rect.bottom - rect.top;
-
-        int transform = list->hwLayers[0].transform;
-
-        if(transform & (HWC_TRANSFORM_ROT_90 | HWC_TRANSFORM_ROT_270))
-            return ((fb_w == h) && (fb_h == w));
-        else
-            return ((fb_h == h) && (fb_w == w));
-    }
+    bool use_copybit = (list->numHwLayers == 1);
 
     if(list->numHwLayers == 2) {
+        int w1, h1;
+        int w2, h2;
 
-        hwc_rect_t rect_1 = list->hwLayers[0].displayFrame;
-        hwc_rect_t rect_2 = list->hwLayers[1].displayFrame;
+        getLayerResolution(&list->hwLayers[0], w1, h1);
+        getLayerResolution(&list->hwLayers[1], w2, h2);
 
-        int transform_1 = list->hwLayers[0].transform;
-        int transform_2 = list->hwLayers[1].transform;
-
-        int w1 = rect_1.right - rect_1.left;
-        int h1 = rect_1.bottom - rect_1.top;
-        int w2 = rect_2.right - rect_2.left;
-        int h2 = rect_2.bottom - rect_2.top;
-
-        if(transform_1 == transform_2) {
-            if(transform_1 & (HWC_TRANSFORM_ROT_90 | HWC_TRANSFORM_ROT_270)) {
-                if((fb_w == (w1 + w2)) && (fb_h == h1) && (fb_h == h2))
-                    return true;
-            } else {
-                if((fb_w == w1) && (fb_w == w2) && (fb_h == (h1 + h2)))
-                    return true;
-            }
-        }
+        use_copybit = ((fb_w >= w1) && (fb_w >= w2) && ((fb_h * 2) > (h1 + h2)));
     }
-    return false;
+
+    return use_copybit;
 }
 
 #ifdef COMPOSITION_BYPASS
@@ -812,10 +1138,11 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
     bool isS3DCompositionNeeded = false;
     int s3dVideoFormat = 0;
     int numLayersNotUpdating = 0;
-    bool fullscreen = false;
+    bool useCopybit = false;
+    bool isSkipLayerPresent = false;
 
     if (list) {
-        fullscreen = isFullScreenUpdate(hwcModule->fbDevice, list);
+        useCopybit = canUseCopybit(hwcModule->fbDevice, list);
         yuvBufferCount = getYUVBufferCount(list);
 
         bool skipComposition = false;
@@ -839,34 +1166,31 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
 
         for (size_t i=0 ; i<list->numHwLayers ; i++) {
             private_handle_t *hnd = (private_handle_t *)list->hwLayers[i].handle;
+
             // If there is a single Fullscreen layer, we can bypass it - TBD
             // If there is only one video/camera buffer, we can bypass itn
             if (list->hwLayers[i].flags & HWC_SKIP_LAYER) {
                 // During the animaton UI layers are marked as SKIP
                 // need to still mark the layer for S3D composition
+                isSkipLayerPresent = true;
+
                 if (isS3DCompositionNeeded)
                     markUILayerForS3DComposition(list->hwLayers[i], s3dVideoFormat);
 
-                if (hwcModule->compositionType
-                        & (COMPOSITION_TYPE_C2D | COMPOSITION_TYPE_MDP)) {
-                    // Ensure that HWC_OVERLAY layers below skip layers do not
-                    // overwrite GPU composed skip layers.
-                    ssize_t layer_countdown = ((ssize_t)i) - 1;
-                    while (layer_countdown >= 0)
-                    {
-                        // Mark every non-mdp overlay layer below the
-                        // skip-layer for GPU composition.
-                        switch(list->hwLayers[layer_countdown].compositionType) {
-                        case HWC_FRAMEBUFFER:
-                        case HWC_USE_OVERLAY:
-                            break;
-                        case HWC_USE_COPYBIT:
-                        default:
-                            list->hwLayers[layer_countdown].compositionType = HWC_FRAMEBUFFER;
-                            break;
-                        }
-                        layer_countdown--;
+                ssize_t layer_countdown = ((ssize_t)i) - 1;
+                // Mark every layer below the SKIP layer to be composed by the GPU
+                while (layer_countdown >= 0)
+                {
+                    private_handle_t *countdown_handle =
+                               (private_handle_t *)list->hwLayers[layer_countdown].handle;
+                    if (countdown_handle && (countdown_handle->bufferType == BUFFER_TYPE_VIDEO)
+                        && (yuvBufferCount == 1)) {
+                        unlockPreviousOverlayBuffer(ctx);
+                        skipComposition = false;
                     }
+                    list->hwLayers[layer_countdown].compositionType = HWC_FRAMEBUFFER;
+                    list->hwLayers[layer_countdown].hints &= ~HWC_HINT_CLEAR_FB;
+                    layer_countdown--;
                 }
                 continue;
             }
@@ -908,7 +1232,7 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
                     (COMPOSITION_TYPE_C2D|COMPOSITION_TYPE_MDP))) {
                 list->hwLayers[i].compositionType = HWC_USE_COPYBIT;
             } else if ((hwcModule->compositionType == COMPOSITION_TYPE_DYN)
-                    && fullscreen) {
+                    && useCopybit) {
                 list->hwLayers[i].compositionType = HWC_USE_COPYBIT;
             }
             else {
@@ -923,27 +1247,32 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
         }
 
 #ifdef COMPOSITION_BYPASS
+        bool isBypassUsed = true;
         //Check if bypass is feasible
-        if(isBypassDoable(dev, yuvBufferCount, list) &&
-                isBypassEfficient(hwcModule->fbDevice, list, ctx)) {
-            //Setup bypass
+        if(isBypassDoable(dev, yuvBufferCount, list) && !isSkipLayerPresent) {
             if(setupBypass(ctx, list)) {
-                //Overwrite layer flags only if setup succeeds.
                 setBypassLayerFlags(ctx, list);
-                list->flags |= HWC_SKIP_COMPOSITION;
                 ctx->bypassState = BYPASS_ON;
+            } else {
+                LOGE_IF(BYPASS_DEBUG,"%s: Bypass setup Failed",__FUNCTION__);
+                isBypassUsed = false;
             }
         } else {
-            unlockPreviousBypassBuffers(ctx);
+            LOGE_IF(BYPASS_DEBUG,"%s: Bypass not possible[%d,%d]",__FUNCTION__,
+                       isBypassDoable(dev, yuvBufferCount, list) && !isSkipLayerPresent );
+            isBypassUsed = false;
+        }
+
+        //Reset bypass states
+        if(!isBypassUsed) {
+            ctx->nPipesUsed = 0;
             unsetBypassLayerFlags(list);
-            unsetBypassBufferLockState(ctx);
             if(ctx->bypassState == BYPASS_ON) {
                 ctx->bypassState = BYPASS_OFF_PENDING;
             }
         }
 #endif
     }
-
     return 0;
 }
 // ---------------------------------------------------------------------------
@@ -1060,11 +1389,82 @@ static int drawLayerUsingCopybit(hwc_composer_device_t *dev, hwc_layer_t *layer,
     dst.base = (void *)fbHandle->base;
     dst.handle = (native_handle_t *)renderBuffer->handle;
 
+    copybit_device_t *copybit = hwcModule->copybitEngine;
+
+    int32_t screen_w        = displayFrame.right - displayFrame.left;
+    int32_t screen_h        = displayFrame.bottom - displayFrame.top;
+    int32_t src_crop_width  = sourceCrop.right - sourceCrop.left;
+    int32_t src_crop_height = sourceCrop.bottom -sourceCrop.top;
+
+    int32_t copybitsMaxScale = copybit->get(copybit,COPYBIT_MAGNIFICATION_LIMIT);
+
+    if(layer->transform & (HWC_TRANSFORM_ROT_90 | HWC_TRANSFORM_ROT_270)){
+        //swap screen width and height
+        int tmp = screen_w;
+        screen_w  = screen_h;
+        screen_h = tmp;
+    }
+    int32_t dsdx = screen_w/src_crop_width;
+    int32_t dtdy = screen_h/src_crop_height;
+    sp<GraphicBuffer> tempBitmap;
+
+    if(dsdx  > copybitsMaxScale || dtdy > copybitsMaxScale){
+        // The requested scale is out of the range the hardware
+        // can support.
+       LOGD("%s:%d::Need to scale dsdx=%d, dtdy=%d,maxScaleInv=%d,screen_w=%d,screen_h=%d \
+                  src_crop_width=%d src_crop_height=%d",__FUNCTION__,__LINE__,
+                  dsdx,dtdy,copybitsMaxScale,screen_w,screen_h,src_crop_width,src_crop_height);
+
+       //Driver makes width and height as even
+       //that may cause wrong calculation of the ratio
+       //in display and crop.Hence we make
+       //crop width and height as even.
+       src_crop_width  = (src_crop_width/2)*2;
+       src_crop_height = (src_crop_height/2)*2;
+
+       int tmp_w =  src_crop_width*copybitsMaxScale;
+       int tmp_h =  src_crop_height*copybitsMaxScale;
+
+       LOGD("%s:%d::tmp_w = %d,tmp_h = %d",__FUNCTION__,__LINE__,tmp_w,tmp_h);
+       tempBitmap = new GraphicBuffer(
+                    tmp_w, tmp_h, src.format,
+                    GraphicBuffer::USAGE_HW_2D);
+
+       err = tempBitmap->initCheck();
+       if (err == android::NO_ERROR){
+            copybit_image_t tmp_dst;
+            copybit_rect_t tmp_rect;
+            tmp_dst.w = tmp_w;
+            tmp_dst.h = tmp_h;
+            tmp_dst.format = tempBitmap->format;
+            tmp_dst.handle = (native_handle_t*)tempBitmap->getNativeBuffer()->handle;
+            tmp_dst.horiz_padding = src.horiz_padding;
+            tmp_dst.vert_padding = src.vert_padding;
+            tmp_rect.l = 0;
+            tmp_rect.t = 0;
+            tmp_rect.r = tmp_dst.w;
+            tmp_rect.b = tmp_dst.h;
+            //create one clip region
+            hwc_rect tmp_hwc_rect = {0,0,tmp_rect.r,tmp_rect.b};
+            hwc_region_t tmp_hwc_reg = {1,(hwc_rect_t const*)&tmp_hwc_rect};
+            region_iterator tmp_it(tmp_hwc_reg);
+            copybit->set_parameter(copybit,COPYBIT_TRANSFORM,0);
+            copybit->set_parameter(copybit, COPYBIT_PLANE_ALPHA,
+                        (layer->blending == HWC_BLENDING_NONE) ? -1 : layer->alpha);
+            err = copybit->stretch(copybit,&tmp_dst, &src, &tmp_rect, &srcRect, &tmp_it);
+            if(err < 0){
+                LOGE("%s:%d::tmp copybit stretch failed",__FUNCTION__,__LINE__);
+                return err;
+            }
+            // copy new src and src rect crop
+            src = tmp_dst;
+            srcRect = tmp_rect;
+      }
+    }
     // Copybit region
     hwc_region_t region = layer->visibleRegionScreen;
     region_iterator copybitRegion(region);
 
-    copybit_device_t *copybit = hwcModule->copybitEngine;
     copybit->set_parameter(copybit, COPYBIT_FRAMEBUFFER_WIDTH, renderBuffer->width);
     copybit->set_parameter(copybit, COPYBIT_FRAMEBUFFER_HEIGHT, renderBuffer->height);
     copybit->set_parameter(copybit, COPYBIT_TRANSFORM, layer->transform);
@@ -1072,6 +1472,8 @@ static int drawLayerUsingCopybit(hwc_composer_device_t *dev, hwc_layer_t *layer,
                            (layer->blending == HWC_BLENDING_NONE) ? -1 : layer->alpha);
     copybit->set_parameter(copybit, COPYBIT_PREMULTIPLIED_ALPHA,
                            (layer->blending == HWC_BLENDING_PREMULT)? COPYBIT_ENABLE : COPYBIT_DISABLE);
+    copybit->set_parameter(copybit, COPYBIT_DITHER,
+                            (dst.format == HAL_PIXEL_FORMAT_RGB_565)? COPYBIT_ENABLE : COPYBIT_DISABLE);
     err = copybit->stretch(copybit, &dst, &src, &dstRect, &srcRect, &copybitRegion);
 
     if(err < 0)
@@ -1127,6 +1529,53 @@ static int drawLayerUsingOverlay(hwc_context_t *ctx, hwc_layer_t *layer)
     return -1;
 }
 
+#ifdef COMPOSITION_BYPASS
+static int drawLayerUsingBypass(hwc_context_t *ctx, hwc_layer_t *layer, int layer_index) {
+
+    int index = getLayerbypassIndex(layer);
+
+    if(index < 0) {
+        LOGE("%s: Invalid bypass index (%d)", __FUNCTION__, index);
+        return -1;
+    }
+
+    if (ctx && ctx->mOvUI[index]) {
+        overlay::OverlayUI *ovUI = ctx->mOvUI[index];
+        int ret = 0;
+
+        private_handle_t *hnd = (private_handle_t *)layer->handle;
+        if(!hnd) {
+            LOGE("%s handle null", __FUNCTION__);
+            return -1;
+        }
+
+        ctx->bypassBufferLockState[index] = BYPASS_BUFFER_UNLOCKED;
+
+        if (GENLOCK_FAILURE == genlock_lock_buffer(hnd, GENLOCK_READ_LOCK,
+                                                   GENLOCK_MAX_TIMEOUT)) {
+            LOGE("%s: genlock_lock_buffer(READ) failed", __FUNCTION__);
+            return -1;
+        }
+
+        ctx->bypassBufferLockState[index] = BYPASS_BUFFER_LOCKED;
+
+        LOGE_IF(BYPASS_DEBUG,"%s: Bypassing layer: %p using pipe: %d",__FUNCTION__, layer, index );
+
+        ret = ovUI->queueBuffer(hnd);
+
+        if (ret) {
+            // Unlock the locked buffer
+            if (GENLOCK_FAILURE == genlock_unlock_buffer(hnd)) {
+                LOGE("%s: genlock_unlock_buffer failed", __FUNCTION__);
+            }
+            ctx->bypassBufferLockState[index] = BYPASS_BUFFER_UNLOCKED;
+            return -1;
+        }
+    }
+    return 0;
+}
+#endif
+
 static int hwc_set(hwc_composer_device_t *dev,
         hwc_display_t dpy,
         hwc_surface_t sur,
@@ -1140,9 +1589,6 @@ static int hwc_set(hwc_composer_device_t *dev,
 
     private_hwc_module_t* hwcModule = reinterpret_cast<private_hwc_module_t*>(
                                                            dev->common.module);
-
-    framebuffer_device_t *fbDev = hwcModule->fbDevice;
-
     if (!list || !hwcModule) {
         LOGE("hwc_set invalid list or module");
 #ifdef COMPOSITION_BYPASS
@@ -1164,7 +1610,7 @@ static int hwc_set(hwc_composer_device_t *dev,
         } else if (list->hwLayers[i].compositionType == HWC_USE_OVERLAY) {
             drawLayerUsingOverlay(ctx, &(list->hwLayers[i]));
         } else if (list->flags & HWC_SKIP_COMPOSITION) {
-            break;
+            continue;
         }
         else if (list->hwLayers[i].compositionType == HWC_USE_COPYBIT) {
             drawLayerUsingCopybit(dev, &(list->hwLayers[i]), (EGLDisplay)dpy, (EGLSurface)sur);
@@ -1176,29 +1622,21 @@ static int hwc_set(hwc_composer_device_t *dev,
     storeLockedBypassHandle(list, ctx);
     // We have stored the handles, unset the current lock states in the context.
     unsetBypassBufferLockState(ctx);
-
-    //Setup for waiting until 1 FB post is done before closing bypass mode.
-    if (ctx->bypassState == BYPASS_OFF_PENDING) {
-        fbDev->resetBufferPostStatus(fbDev);
-    }
+    closeExtraPipes(ctx);
+#if BYPASS_DEBUG
+    if(list->flags & HWC_SKIP_COMPOSITION)
+        LOGE("%s: skipping eglSwapBuffer call", __FUNCTION__);
 #endif
-
+#endif
     // Do not call eglSwapBuffers if we the skip composition flag is set on the list.
     if (!(list->flags & HWC_SKIP_COMPOSITION)) {
         EGLBoolean sucess = eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)sur);
         if (!sucess) {
             ret = HWC_EGL_ERROR;
-            LOGE("eglSwapBuffers() failed in %s", __FUNCTION__);
         }
     }
 #ifdef COMPOSITION_BYPASS
     if(ctx->bypassState == BYPASS_OFF_PENDING) {
-        //Close channels only after fb content is displayed.
-        //We have already reset status before eglSwapBuffers.
-        if (!(list->flags & HWC_SKIP_COMPOSITION)) {
-            fbDev->waitForBufferPost(fbDev);
-        }
-
         closeBypass(ctx);
         ctx->bypassState = BYPASS_OFF;
     }
@@ -1310,6 +1748,7 @@ static int hwc_device_open(const struct hw_module_t* module, const char* name,
         struct hw_device_t** device)
 {
     int status = -EINVAL;
+
     if (!strcmp(name, HWC_HARDWARE_COMPOSER)) {
 	 private_hwc_module_t* hwcModule = reinterpret_cast<private_hwc_module_t*>
                                         (const_cast<hw_module_t*>(module));
@@ -1321,13 +1760,13 @@ static int hwc_device_open(const struct hw_module_t* module, const char* name,
         /* initialize our state here */
         memset(dev, 0, sizeof(*dev));
         dev->mOverlayLibObject = new overlay::Overlay();
+
 #ifdef COMPOSITION_BYPASS
         for(int i = 0; i < MAX_BYPASS_LAYERS; i++) {
             dev->mOvUI[i] = new overlay::OverlayUI();
             dev->previousBypassHandle[i] = NULL;
         }
         unsetBypassBufferLockState(dev);
-        dev->animCount = 0;
         dev->bypassState = BYPASS_OFF;
 #endif
 

@@ -40,6 +40,8 @@ using namespace android;
 using android::sp;
 using android::GraphicBuffer;
 
+#define HWC_BYPASS_INDEX_MASK 0x00000030
+
 /*
  * Qcom specific Native Window perform operations
  */
@@ -79,6 +81,8 @@ enum {
     HWC_USE_ORIGINAL_RESOLUTION = 0x10000000,
     HWC_DO_NOT_USE_OVERLAY      = 0x20000000,
     HWC_COMP_BYPASS             = 0x40000000,
+    HWC_BYPASS_RESERVE_0        = 0x00000010,
+    HWC_BYPASS_RESERVE_1        = 0x00000020,
 };
 
 enum HWCCompositionType {
@@ -122,6 +126,17 @@ int checkBuffer(native_handle_t *buffer_handle, int size, int usage);
  * @return true if the format is supported by the GPU.
  */
 bool isGPUSupportedFormat(int format);
+
+/*
+ * Checks if the format is natively supported by the GPU.
+ * For now, we use this function to check only if CHECK_FOR_EXTERNAL_FORMAT
+ * is set.
+ *
+ * @param: format to check
+ *
+ * @return true if the format is supported by the GPU.
+ */
+bool isGPUSupportedFormatInHW(int format);
 
 /*
  * Gets the number of arguments required for this operation.

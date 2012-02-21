@@ -145,6 +145,35 @@ bool isGPUSupportedFormat(int format) {
 }
 
 /*
+ * Checks if the format is natively supported by the GPU.
+ * For now, we use this function to check only if CHECK_FOR_EXTERNAL_FORMAT
+ * is set.
+ *
+ * @param: format to check
+ *
+ * @return true if the format is supported by the GPU.
+ */
+bool isGPUSupportedFormatInHW(int format) {
+   // For 7x27A bypass creating EGL image for formats not natively supported
+    // in GPU.
+    // This is done to save CPU utilization by SurfaceFlinger thread
+#ifdef CHECK_FOR_EXTERNAL_FORMAT
+
+    if (format == HAL_PIXEL_FORMAT_YV12){
+        return false;
+    } else if (format == HAL_PIXEL_FORMAT_YCrCb_420_SP) {
+        return false;
+    } else if (format == HAL_PIXEL_FORMAT_YCbCr_420_SP) {
+        return false;
+    } else if (format == HAL_PIXEL_FORMAT_NV12_ENCODEABLE) {
+       return false;
+    }
+#endif
+
+    return true;
+}
+
+/*
  * Function to check if the allocated buffer is of the correct size.
  * Reallocate the buffer with the correct size, if the size doesn't
  * match
@@ -158,7 +187,7 @@ bool isGPUSupportedFormat(int format) {
 int checkBuffer(native_handle_t *buffer_handle, int size, int usage)
 {
     // If the client hasn't set a size, return
-    if (0 == size) {
+    if (0 >= size) {
         return 0;
     }
 
@@ -170,10 +199,9 @@ int checkBuffer(native_handle_t *buffer_handle, int size, int usage)
 
     // Obtain the private_handle from the native handle
     private_handle_t *hnd = reinterpret_cast<private_handle_t*>(buffer_handle);
-    if (hnd->size < size) {
+    if (hnd->size != size) {
         return reallocate_memory(hnd, size, usage);
     }
-
     return 0;
 }
 
